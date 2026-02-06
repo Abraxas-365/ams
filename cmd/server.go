@@ -1,13 +1,20 @@
-// server.go
 package main
 
 import (
-	"context"
+	"bufio"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	appcontext "github.com/Abraxas-365/ams/context"
+	"github.com/Abraxas-365/ams/manifest"
+	"github.com/Abraxas-365/ams/orchestator"
+	"github.com/Abraxas-365/ams/pkg/ai/llm"
+	"github.com/Abraxas-365/ams/pkg/ai/llm/memoryx/memoryinfra"
+	"github.com/Abraxas-365/ams/pkg/ai/llm/memoryx/memorysrv"
+	aiopenai "github.com/Abraxas-365/ams/pkg/ai/providers/openai"
 	"github.com/Abraxas-365/ams/pkg/config"
 	"github.com/Abraxas-365/ams/pkg/errx"
 	"github.com/Abraxas-365/ams/pkg/logx"
@@ -16,6 +23,9 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 )
 
 func main() {
@@ -25,10 +35,452 @@ func main() {
 		logx.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// 2. Initialize Logger with config
+	// 2. Initialize Logger
+	initLogger(cfg)
+
+	logx.Info("🚀 Starting Manifesto AI Orchestrator...")
+	logx.Infof("Environment: %s", cfg.Server.Environment)
+
+	// 3. Initialize Core Dependencies
+
+	// --- A. Database (Optional) ---
+	db, err := initDatabase()
+	if err != nil {
+		logx.Warnf("⚠️ Database not available: %v", err)
+		logx.Info("ℹ️ Running without session persistence (buffer memory only)")
+		db = nil
+	} else {
+		logx.Info("✅ Database connected successfully")
+	}
+
+	// --- B. AI Client (OpenAI) ---
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		logx.Warn("⚠️ OPENAI_API_KEY not set. AI features may fail.")
+	}
+	openaiProvider := aiopenai.NewOpenAIProvider(apiKey)
+	llmClient := llm.NewClient(openaiProvider)
+
+	// --- C. Manifest Registry ---
+	manifestReg := manifest.NewRegistry()
+	manifestPath := os.Getenv("MANIFEST_PATH")
+	if manifestPath == "" {
+		manifestPath = "manifest.yaml"
+	}
+
+	if err := manifestReg.LoadFromFile(manifestPath); err != nil {
+		logx.Fatalf("❌ Failed to load manifest file: %v", err)
+	}
+	logx.Infof("✅ Manifest loaded from %s (Routes: %d)", manifestPath, len(manifestReg.ListRoutes()))
+
+	// --- D. Session Service (if DB available) ---
+	var sessionService *memorysrv.SessionService
+	if db != nil {
+		sessionRepo := memoryinfra.NewPostgresSessionRepository(db)
+		sessionService = memorysrv.NewSessionService(sessionRepo)
+		logx.Info("✅ Session service initialized (database-backed memory)")
+	} else {
+		logx.Info("ℹ️ Session service disabled (using buffer memory only)")
+	}
+
+	// --- E. Context & Orchestrator ---
+	providerLoader := appcontext.NewProviderLoader()
+	contextBuilder := appcontext.NewBuilder(providerLoader)
+
+	orchConfig := orchestator.Config{
+		LLMClient:      *llmClient,
+		ContextBuilder: contextBuilder,
+		ManifestReg:    manifestReg,
+		MemoryFactory:  orchestator.NewBufferMemoryFactory(),
+		SessionService: sessionService,
+	}
+
+	orch := orchestator.NewOrchestrator(orchConfig)
+
+	// 4. Create Fiber App
+	app := fiber.New(fiber.Config{
+		AppName:               "Manifesto Orchestrator",
+		DisableStartupMessage: true,
+		ErrorHandler:          globalErrorHandler(cfg),
+		BodyLimit:             10 * 1024 * 1024,
+		IdleTimeout:           120 * time.Second,
+	})
+
+	// 5. Middleware
+	setupMiddleware(app, cfg)
+
+	// 6. Routes
+	registerRoutes(app, orch)
+
+	// 7. Start Server
+	startServer(app, cfg)
+}
+
+// ============================================================================
+// Database Initialization
+// ============================================================================
+
+func initDatabase() (*sqlx.DB, error) {
+	host := os.Getenv("DB_HOST")
+	if host == "" {
+		return nil, fmt.Errorf("DB_HOST environment variable not set")
+	}
+
+	port := os.Getenv("DB_PORT")
+	if port == "" {
+		port = "5432"
+	}
+
+	user := os.Getenv("DB_USER")
+	if user == "" {
+		return nil, fmt.Errorf("DB_USER environment variable not set")
+	}
+
+	password := os.Getenv("DB_PASSWORD")
+	if password == "" {
+		return nil, fmt.Errorf("DB_PASSWORD environment variable not set")
+	}
+
+	dbname := os.Getenv("DB_NAME")
+	if dbname == "" {
+		return nil, fmt.Errorf("DB_NAME environment variable not set")
+	}
+
+	sslMode := os.Getenv("DB_SSL_MODE")
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	connStr := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		host, port, user, password, dbname, sslMode,
+	)
+
+	logx.WithFields(logx.Fields{
+		"host": host,
+		"port": port,
+		"user": user,
+		"db":   dbname,
+	}).Debug("Connecting to database")
+
+	db, err := sqlx.Connect("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	maxOpenConns := 25
+	maxIdleConns := 5
+	connMaxLifetime := 5 * time.Minute
+
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(connMaxLifetime)
+
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	logx.WithFields(logx.Fields{
+		"max_open_conns": maxOpenConns,
+		"max_idle_conns": maxIdleConns,
+		"conn_lifetime":  connMaxLifetime,
+	}).Info("Database connection pool configured")
+
+	return db, nil
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// generateAnonymousID creates a unique identifier for anonymous users
+func generateAnonymousID() string {
+	return fmt.Sprintf("anon_%s", uuid.New().String())
+}
+
+// setupAnonymousUser sets up user context for anonymous/unauthenticated requests
+func setupAnonymousUser(req *orchestator.ChatRequest) {
+	req.BearerToken = ""
+
+	// Initialize Frontend context if nil
+	if req.Frontend == nil {
+		req.Frontend = &appcontext.FrontendContext{}
+	}
+
+	// Get or generate anonymous ID from frontend context
+	anonymousID := req.Frontend.AnonymousID
+	if anonymousID == "" {
+		anonymousID = generateAnonymousID()
+		req.Frontend.AnonymousID = anonymousID
+		logx.WithField("generated_id", anonymousID).Debug("Generated new anonymous ID")
+	}
+
+	// Create anonymous user with unique ID
+	if req.User == nil {
+		req.User = &appcontext.User{
+			ID:    anonymousID,
+			Email: fmt.Sprintf("%s@anonymous.local", anonymousID),
+			Name:  "Anonymous User",
+		}
+	}
+}
+
+// ============================================================================
+// Routes
+// ============================================================================
+
+func registerRoutes(app *fiber.App, orch *orchestator.Orchestrator) {
+	// Health check
+	app.Get("/health", func(c *fiber.Ctx) error {
+		health := fiber.Map{
+			"status": "healthy",
+			"mode":   "orchestrator",
+		}
+
+		if err := orch.Health(c.Context()); err != nil {
+			health["status"] = "degraded"
+			health["error"] = err.Error()
+		}
+
+		return c.JSON(health)
+	})
+
+	// List available routes
+	app.Get("/routes", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"routes": orch.ListRoutes(),
+			"stats":  orch.Stats(),
+		})
+	})
+
+	// ========================================================================
+	// Chat Endpoints
+	// ========================================================================
+
+	// 1. Standard Chat
+	app.Post("/api/v1/chat", func(c *fiber.Ctx) error {
+		var req orchestator.ChatRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid request body",
+			})
+		}
+
+		// Setup anonymous user with unique ID
+		setupAnonymousUser(&req)
+
+		response, err := orch.HandleChat(c.Context(), req)
+		if err != nil {
+			return err
+		}
+
+		// Return anonymous_id back to client
+		return c.JSON(fiber.Map{
+			"response":     response,
+			"anonymous_id": req.Frontend.AnonymousID,
+			"session_id":   response.SessionID,
+		})
+	})
+
+	// 2. Streaming Chat
+	app.Post("/api/v1/chat/stream", func(c *fiber.Ctx) error {
+		var req orchestator.ChatRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid request body",
+			})
+		}
+
+		// Setup anonymous user with unique ID
+		setupAnonymousUser(&req)
+		anonymousID := req.Frontend.AnonymousID
+
+		c.Set("Content-Type", "text/event-stream")
+		c.Set("Cache-Control", "no-cache")
+		c.Set("Connection", "keep-alive")
+		c.Set("Transfer-Encoding", "chunked")
+
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			// Send anonymous_id as first event
+			fmt.Fprintf(w, "event: init\ndata: {\"anonymous_id\":\"%s\"}\n\n", anonymousID)
+			_ = w.Flush()
+
+			_ = orch.HandleChatStream(c.Context(), req, func(chunk orchestator.StreamChunk) {
+				if chunk.Error != "" {
+					fmt.Fprintf(w, "event: error\ndata: {\"error\":\"%s\"}\n\n", chunk.Error)
+				} else if chunk.Done {
+					if chunk.SessionID != "" {
+						fmt.Fprintf(w, "event: done\ndata: {\"session_id\":\"%s\",\"anonymous_id\":\"%s\"}\n\n",
+							chunk.SessionID, anonymousID)
+					} else {
+						fmt.Fprintf(w, "event: done\ndata: {\"anonymous_id\":\"%s\"}\n\n", anonymousID)
+					}
+				} else {
+					fmt.Fprintf(w, "event: message\ndata: %s\n\n", chunk.Content)
+				}
+				_ = w.Flush()
+			})
+		})
+		return nil
+	})
+
+	// ========================================================================
+	// Session Management Endpoints
+	// ========================================================================
+
+	sessionAPI := app.Group("/api/v1/sessions")
+
+	// Create a new session
+	sessionAPI.Post("/", func(c *fiber.Ctx) error {
+		type CreateSessionRequest struct {
+			AnonymousID string                      `json:"anonymous_id"`           // From frontend
+			Title       string                      `json:"title"`                  // Session title
+			RoutePath   string                      `json:"route_path"`             // Route pattern
+			RouteParams map[string]string           `json:"route_params,omitempty"` // ✅ Optional route params
+			Frontend    *appcontext.FrontendContext `json:"frontend,omitempty"`     // ✅ Optional frontend context
+		}
+
+		var req CreateSessionRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid request body",
+			})
+		}
+
+		// Validate or generate anonymous ID
+		anonymousID := req.AnonymousID
+		if anonymousID == "" {
+			anonymousID = generateAnonymousID()
+			logx.Debug("Generated anonymous ID for session creation")
+		}
+
+		// Default values
+		if req.Title == "" {
+			req.Title = "New Chat Session"
+		}
+		if req.RoutePath == "" {
+			req.RoutePath = "/"
+		}
+
+		// ✅ Create session with optional route params and frontend context
+		sessionID, err := orch.CreateSessionWithContext(
+			c.Context(),
+			anonymousID,
+			req.Title,
+			req.RoutePath,
+			req.RouteParams, // Frontend sends this when it has route data
+			req.Frontend,    // Frontend sends accessibility/viewport data
+		)
+		if err != nil {
+			logx.WithError(err).Error("Failed to create session")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to create session",
+			})
+		}
+
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"session_id":   sessionID,
+			"anonymous_id": anonymousID,
+			"title":        req.Title,
+		})
+	})
+
+	// List sessions for an anonymous user
+	sessionAPI.Get("/", func(c *fiber.Ctx) error {
+		anonymousID := c.Query("anonymous_id")
+		if anonymousID == "" {
+			anonymousID = c.Get("X-Anonymous-ID")
+		}
+
+		if anonymousID == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "anonymous_id is required (query param or X-Anonymous-ID header)",
+			})
+		}
+
+		limit := c.QueryInt("limit", 20)
+		offset := c.QueryInt("offset", 0)
+
+		sessions, err := orch.ListUserSessions(c.Context(), anonymousID, limit, offset)
+		if err != nil {
+			logx.WithError(err).Error("Failed to list sessions")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to list sessions",
+			})
+		}
+
+		return c.JSON(fiber.Map{
+			"sessions":     sessions,
+			"count":        len(sessions),
+			"limit":        limit,
+			"offset":       offset,
+			"anonymous_id": anonymousID,
+		})
+	})
+
+	// Get session by ID
+	sessionAPI.Get("/:session_id", func(c *fiber.Ctx) error {
+		sessionID := c.Params("session_id")
+
+		session, err := orch.GetSession(c.Context(), sessionID)
+		if err != nil {
+			logx.WithError(err).Error("Failed to get session")
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Session not found",
+			})
+		}
+
+		return c.JSON(session)
+	})
+
+	// Get session with messages
+	sessionAPI.Get("/:session_id/messages", func(c *fiber.Ctx) error {
+		sessionID := c.Params("session_id")
+
+		sessionWithMessages, err := orch.GetSessionWithMessages(c.Context(), sessionID)
+		if err != nil {
+			logx.WithError(err).Error("Failed to get session with messages")
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Session not found",
+			})
+		}
+
+		return c.JSON(sessionWithMessages)
+	})
+
+	// Delete session
+	sessionAPI.Delete("/:session_id", func(c *fiber.Ctx) error {
+		sessionID := c.Params("session_id")
+
+		if err := orch.DeleteSession(c.Context(), sessionID); err != nil {
+			logx.WithError(err).Error("Failed to delete session")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to delete session",
+			})
+		}
+
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	// Utility: Generate new anonymous ID
+	app.Get("/api/v1/anonymous-id", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"anonymous_id": generateAnonymousID(),
+		})
+	})
+}
+
+// ============================================================================
+// Setup & Configuration
+// ============================================================================
+
+func initLogger(cfg *config.Config) {
 	switch cfg.Server.LogLevel {
 	case "debug":
 		logx.SetLevel(logx.LevelDebug)
+	case "trace":
+		logx.SetLevel(logx.LevelTrace)
 	case "warn":
 		logx.SetLevel(logx.LevelWarn)
 	case "error":
@@ -37,55 +489,11 @@ func main() {
 		logx.SetLevel(logx.LevelInfo)
 	}
 
-	logx.Info("🚀 Starting Manifesto API Server...")
-	logx.Infof("Environment: %s", cfg.Server.Environment)
-
-	// 3. Initialize Dependency Container
-	container := NewContainer(cfg)
-	defer container.Cleanup()
-
-	// 4. Start background services
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	container.StartBackgroundServices(ctx)
-
-	// 5. Create Fiber App with Config
-	app := fiber.New(fiber.Config{
-		AppName:               "Manifesto API",
-		DisableStartupMessage: true,
-		ErrorHandler:          globalErrorHandler(cfg),
-		BodyLimit:             10 * 1024 * 1024, // 10MB for file uploads
-		IdleTimeout:           120,
-		EnablePrintRoutes:     false,
-	})
-
-	// 6. Global Middleware
-	setupMiddleware(app, cfg)
-
-	// 7. Health Check & Info Endpoints
-	app.Get("/health", healthCheckHandler(container))
-	app.Get("/", infoHandler(cfg))
-	app.Get("/api/v1/docs", apiDocsHandler(cfg))
-
-	// 8. Register Routes
-	registerRoutes(app, container)
-
-	// 9. 404 Handler
-	app.Use(notFoundHandler)
-
-	// 10. Print Route Summary
-	printRouteSummary()
-
-	// 11. Start Server with Graceful Shutdown
-	startServer(app, cfg, cancel)
+	logx.WithField("level", cfg.Server.LogLevel).Info("Logger initialized")
 }
 
-// ============================================================================
-// Setup Functions
-// ============================================================================
-
 func setupMiddleware(app *fiber.App, cfg *config.Config) {
-	// Panic recovery
+	// Recover from panics
 	app.Use(recover.New(recover.Config{
 		EnableStackTrace: cfg.IsDevelopment(),
 	}))
@@ -93,412 +501,72 @@ func setupMiddleware(app *fiber.App, cfg *config.Config) {
 	// Request ID
 	app.Use(requestid.New(requestid.Config{
 		Header: "X-Request-ID",
-		Generator: func() string {
-			return generateRequestID()
-		},
 	}))
 
 	// CORS
-	corsOrigins := "*"
-	if len(cfg.Server.CORSOrigins) > 0 {
-		corsOrigins = ""
-		for i, origin := range cfg.Server.CORSOrigins {
-			if i > 0 {
-				corsOrigins += ","
-			}
-			corsOrigins += origin
-		}
-	}
-
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     corsOrigins,
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-API-Key, X-Request-ID",
-		AllowMethods:     "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS",
-		AllowCredentials: true,
-		ExposeHeaders:    "X-Request-ID",
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Request-ID, X-Anonymous-ID",
+		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
 	}))
 
-	// Request logger
-	logFormat := "${time} | ${status} | ${latency} | ${method} ${path}"
-	if cfg.IsDevelopment() {
-		logFormat += " | ${ip} | ${reqHeader:X-Request-ID}\n"
-	} else {
-		logFormat += "\n"
-	}
-
+	// Request logging
 	app.Use(logger.New(logger.Config{
-		Format:     logFormat,
-		TimeFormat: "2006-01-02 15:04:05",
+		Format:     "${time} | ${status} | ${latency} | ${method} ${path}\n",
+		TimeFormat: "15:04:05",
 		TimeZone:   "Local",
 	}))
 }
 
-func registerRoutes(app *fiber.App, container *Container) {
-	logx.Info("📝 Registering routes...")
-
-	// ========================================================================
-	// Core Authentication Routes
-	// ========================================================================
-
-	// OAuth Authentication
-	// Routes: /auth/login, /auth/callback/:provider, /auth/refresh, /auth/logout, /auth/me
-	container.OAuthHandlers.RegisterRoutes(app)
-	logx.Info("✓ OAuth routes registered")
-
-	// Passwordless Authentication (OTP-based)
-	// Routes: /auth/passwordless/*
-	container.PasswordlessHandlers.RegisterRoutes(app)
-	logx.Info("✓ Passwordless auth routes registered")
-
-	// ========================================================================
-	// IAM (Identity & Access Management) Routes
-	// ========================================================================
-
-	// API Routes Group
-	api := app.Group("/api/v1")
-
-	// API Keys Management: /api/v1/api-keys/*
-	container.APIKeyHandlers.RegisterRoutes(api, container.UnifiedAuthMiddleware)
-	logx.Info("✓ API Key routes registered")
-
-	// Invitations Management: /api/v1/invitations/*
-	container.InvitationHandlers.RegisterRoutes(api, container.UnifiedAuthMiddleware)
-	logx.Info("✓ Invitation routes registered")
-
-	logx.Info("✅ All routes registered")
-}
-
-// ============================================================================
-// Handler Functions
-// ============================================================================
-
-// healthCheckHandler returns a health check handler
-func healthCheckHandler(container *Container) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		health := fiber.Map{
-			"status":      "healthy",
-			"service":     "manifesto-api",
-			"version":     container.Config.Server.BaseURL,
-			"environment": container.Config.Server.Environment,
-			"timestamp":   fmt.Sprintf("%d", c.Context().Time().Unix()),
-		}
-
-		// Check database
-		if err := container.DB.Ping(); err != nil {
-			health["db"] = "unhealthy"
-			health["db_error"] = err.Error()
-			health["status"] = "degraded"
-		} else {
-			health["db"] = "healthy"
-		}
-
-		// Check Redis
-		if _, err := container.Redis.Ping(c.Context()).Result(); err != nil {
-			health["redis"] = "unhealthy"
-			health["redis_error"] = err.Error()
-			health["status"] = "degraded"
-		} else {
-			health["redis"] = "healthy"
-		}
-
-		// Check storage (optional - can be slow)
-		checkStorage := c.QueryBool("check_storage", false)
-		if checkStorage {
-			if exists, err := container.FileSystem.Exists(c.Context(), ".health-check"); err != nil {
-				health["storage"] = "unhealthy"
-				health["storage_error"] = err.Error()
-			} else {
-				health["storage"] = "healthy"
-				health["storage_accessible"] = exists
-			}
-		}
-
-		status := fiber.StatusOK
-		if health["status"] == "degraded" {
-			status = fiber.StatusServiceUnavailable
-		}
-
-		return c.Status(status).JSON(health)
-	}
-}
-
-// infoHandler returns basic API information
-func infoHandler(cfg *config.Config) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"service":     "Manifesto API",
-			"version":     "1.0.0",
-			"description": "AI-Powered Applicant Tracking System",
-			"environment": cfg.Server.Environment,
-			"features": []string{
-				"Multi-tenant architecture",
-				"OAuth authentication (Google, Microsoft)",
-				"Passwordless authentication (OTP-based)",
-				"API key management",
-				"Role-based access control (RBAC)",
-				"Account linking (OAuth + OTP)",
-				"User invitations",
-			},
-			"endpoints": fiber.Map{
-				"docs":   "/api/v1/docs",
-				"health": "/health",
-			},
-			"authentication": fiber.Map{
-				"oauth_providers": getEnabledOAuthProviders(cfg),
-				"passwordless":    true,
-			},
-		})
-	}
-}
-
-// apiDocsHandler returns API documentation
-func apiDocsHandler(cfg *config.Config) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"api_version": "v1",
-			"base_url":    cfg.Server.BaseURL,
-			"endpoints": fiber.Map{
-				"authentication": fiber.Map{
-					"oauth": fiber.Map{
-						"login":    "POST /auth/login",
-						"callback": "GET /auth/callback/:provider",
-						"refresh":  "POST /auth/refresh",
-						"logout":   "POST /auth/logout",
-						"me":       "GET /auth/me",
-					},
-					"passwordless": fiber.Map{
-						"tenant_lookup":   "POST /auth/passwordless/tenants",
-						"signup_initiate": "POST /auth/passwordless/signup/initiate",
-						"signup_verify":   "POST /auth/passwordless/signup/verify",
-						"login_initiate":  "POST /auth/passwordless/login/initiate",
-						"login_verify":    "POST /auth/passwordless/login/verify",
-						"resend_otp":      "POST /auth/passwordless/resend-otp",
-					},
-				},
-				"iam": fiber.Map{
-					"api_keys": fiber.Map{
-						"list":   "GET /api/v1/api-keys",
-						"create": "POST /api/v1/api-keys",
-						"get":    "GET /api/v1/api-keys/:id",
-						"update": "PUT /api/v1/api-keys/:id",
-						"revoke": "POST /api/v1/api-keys/:id/revoke",
-						"delete": "DELETE /api/v1/api-keys/:id",
-					},
-					"invitations": fiber.Map{
-						"list":     "GET /api/v1/invitations",
-						"pending":  "GET /api/v1/invitations/pending",
-						"create":   "POST /api/v1/invitations",
-						"get":      "GET /api/v1/invitations/:id",
-						"validate": "GET /api/v1/invitations/public/validate?token=...",
-						"revoke":   "POST /api/v1/invitations/:id/revoke",
-						"delete":   "DELETE /api/v1/invitations/:id",
-					},
-				},
-			},
-			"authentication_methods": fiber.Map{
-				"types": []string{"OAuth (Google/Microsoft)", "Passwordless OTP", "API Key"},
-				"headers": fiber.Map{
-					"jwt":     "Authorization: Bearer <jwt_token>",
-					"api_key": "X-API-Key: <api_key> OR Authorization: Bearer <api_key>",
-					"cookie":  "Cookie: access_token=<jwt_token>",
-				},
-				"oauth_providers": getEnabledOAuthProviders(cfg),
-				"passwordless": fiber.Map{
-					"enabled":      true,
-					"method":       "OTP via email",
-					"otp_length":   cfg.Auth.OTP.CodeLength,
-					"otp_ttl":      cfg.Auth.OTP.ExpirationTime.String(),
-					"max_attempts": cfg.Auth.OTP.MaxAttempts,
-				},
-				"account_linking": fiber.Map{
-					"enabled":     true,
-					"description": "Users can link OAuth and OTP authentication to the same account",
-				},
-			},
-			"rate_limiting": fiber.Map{
-				"otp_requests": fmt.Sprintf("1 per %s", cfg.Auth.OTP.RateLimitWindow),
-			},
-			"config": fiber.Map{
-				"jwt_ttl": fiber.Map{
-					"access_token":  cfg.Auth.JWT.AccessTokenTTL.String(),
-					"refresh_token": cfg.Auth.JWT.RefreshTokenTTL.String(),
-				},
-				"session_ttl":                        cfg.Auth.Session.ExpirationTime.String(),
-				"invitation_default_expiration_days": cfg.Auth.Invitation.DefaultExpirationDays,
-				"otp_expiration":                     cfg.Auth.OTP.ExpirationTime.String(),
-			},
-		})
-	}
-}
-
-// notFoundHandler handles 404 errors
-func notFoundHandler(c *fiber.Ctx) error {
-	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-		"error":      "Route not found",
-		"code":       "NOT_FOUND",
-		"path":       c.Path(),
-		"method":     c.Method(),
-		"message":    "The requested endpoint does not exist. Visit /api/v1/docs for documentation.",
-		"request_id": c.Get("X-Request-ID"),
-	})
-}
-
-// ============================================================================
-// Error Handler
-// ============================================================================
-
-// globalErrorHandler converts internal errors to standard HTTP responses
 func globalErrorHandler(cfg *config.Config) fiber.ErrorHandler {
 	return func(c *fiber.Ctx, err error) error {
-		// Log the error with context
 		logx.WithFields(logx.Fields{
 			"path":       c.Path(),
 			"method":     c.Method(),
-			"ip":         c.IP(),
 			"request_id": c.Get("X-Request-ID"),
-			"user_agent": c.Get("User-Agent"),
 		}).Errorf("Request error: %v", err)
 
-		// If it's a Fiber error
-		if e, ok := err.(*fiber.Error); ok {
-			return c.Status(e.Code).JSON(fiber.Map{
-				"error":      e.Message,
-				"code":       "FIBER_ERROR",
-				"status":     e.Code,
-				"request_id": c.Get("X-Request-ID"),
+		if e, ok := err.(*errx.Error); ok {
+			return c.Status(e.HTTPStatus).JSON(fiber.Map{
+				"error":  e.Message,
+				"code":   e.Code,
+				"status": e.HTTPStatus,
 			})
 		}
 
-		// If it's our custom errx.Error
-		if e, ok := err.(*errx.Error); ok {
-			response := fiber.Map{
-				"error":      e.Message,
-				"code":       e.Code,
-				"type":       string(e.Type),
-				"status":     e.HTTPStatus,
-				"request_id": c.Get("X-Request-ID"),
-			}
-
-			// Include details if present
-			if len(e.Details) > 0 {
-				response["details"] = e.Details
-			}
-
-			// Include underlying error in debug mode
-			if cfg.IsDevelopment() && e.Err != nil {
-				response["underlying_error"] = e.Err.Error()
-			}
-
-			return c.Status(e.HTTPStatus).JSON(response)
+		if e, ok := err.(*fiber.Error); ok {
+			return c.Status(e.Code).JSON(fiber.Map{
+				"error": e.Message,
+			})
 		}
 
-		// Default unknown error
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error":      "Internal Server Error",
-			"type":       "INTERNAL",
-			"code":       "INTERNAL_ERROR",
-			"message":    "An unexpected error occurred. Please contact support if the issue persists.",
-			"request_id": c.Get("X-Request-ID"),
+			"error": "Internal Server Error",
 		})
 	}
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-// getEnabledOAuthProviders returns list of enabled OAuth providers
-func getEnabledOAuthProviders(cfg *config.Config) []string {
-	providers := []string{}
-	if cfg.OAuth.Google.Enabled {
-		providers = append(providers, "google")
-	}
-	if cfg.OAuth.Microsoft.Enabled {
-		providers = append(providers, "microsoft")
-	}
-	return providers
-}
-
-// generateRequestID generates a unique request ID
-func generateRequestID() string {
-	return "req-" + randomString(16)
-}
-
-// randomString generates a random string of given length
-func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[i%len(letters)]
-	}
-	return string(b)
-}
-
-// printRouteSummary prints a summary of registered routes
-func printRouteSummary() {
-	logx.Info("📋 Route Summary:")
-	logx.Info("   ├─ Health: /health")
-	logx.Info("   ├─ Info: /")
-	logx.Info("   ├─ Docs: /api/v1/docs")
-	logx.Info("   ├─ OAuth Auth: /auth/*")
-	logx.Info("   ├─ Passwordless Auth: /auth/passwordless/*")
-	logx.Info("   ├─ API Keys: /api/v1/api-keys/*")
-	logx.Info("   └─ Invitations: /api/v1/invitations/*")
-}
-
-// startServer starts the server with graceful shutdown
-func startServer(app *fiber.App, cfg *config.Config, cancel context.CancelFunc) {
+func startServer(app *fiber.App, cfg *config.Config) {
 	port := fmt.Sprintf("%d", cfg.Server.Port)
 
-	// Run server in a goroutine
 	go func() {
-		logx.Info("=" + repeatString("=", 70))
 		logx.Infof("🚀 Server listening on port %s", port)
-		logx.Infof("📚 API Docs: http://localhost:%s/api/v1/docs", port)
-		logx.Infof("💚 Health Check: http://localhost:%s/health", port)
-		logx.Infof("🔒 Environment: %s", cfg.Server.Environment)
-
-		// Authentication methods
-		logx.Info("")
-		logx.Info("🔐 Authentication Methods:")
-		if cfg.OAuth.Google.Enabled {
-			logx.Info("   ✅ Google OAuth")
-		}
-		if cfg.OAuth.Microsoft.Enabled {
-			logx.Info("   ✅ Microsoft OAuth")
-		}
-		logx.Info("   ✅ Passwordless OTP (Email)")
-		logx.Info("   ✅ API Keys")
-		logx.Info("   ✅ Account Linking (OAuth + OTP)")
-
-		logx.Info("=" + repeatString("=", 70))
-
+		logx.Infof("📡 Health check: http://localhost:%s/health", port)
+		logx.Infof("📋 Routes list: http://localhost:%s/routes", port)
 		if err := app.Listen(":" + port); err != nil {
 			logx.Fatalf("Server error: %v", err)
 		}
 	}()
 
-	// Graceful shutdown
-	gracefulShutdown(app, cancel)
-}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
 
-// gracefulShutdown handles graceful server shutdown
-func gracefulShutdown(app *fiber.App, cancel context.CancelFunc) {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	logx.Info("🛑 Shutting down server...")
 
-	// Wait for interrupt signal
-	sig := <-sigChan
-	logx.Infof("🛑 Received signal: %v", sig)
-	logx.Info("Shutting down gracefully...")
-
-	// Cancel context to stop background services
-	cancel()
-
-	// Shutdown the server with timeout
-	if err := app.ShutdownWithTimeout(30); err != nil {
+	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
 		logx.Errorf("Server forced to shutdown: %v", err)
 	}
 
-	logx.Info("✅ Server exited successfully")
+	logx.Info("✅ Server exited gracefully")
 }

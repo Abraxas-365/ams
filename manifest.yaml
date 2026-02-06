@@ -1,0 +1,554 @@
+version: "1.0"
+
+# ==============================================================================
+# E-COMMERCE SUPPORT DASHBOARD
+# Routes for customer service agents to manage customers, orders, and inventory
+# ==============================================================================
+
+routes:
+  # ============================================================================
+  # Customer Profile Page
+  # ============================================================================
+  - pattern: "/customers/:customer_id"
+    name: "customer_profile"
+    description: "View customer profile, order history, and manage customer account"
+    
+    context:
+      providers:
+        # Get full customer details
+        - type: "http"
+          name: "customer_details"
+          url: "http://localhost:3001/v1/customers/{customer_id}"
+          method: "GET"
+          timeout: "5s"
+        
+        # Get customer's recent orders
+        - type: "http"
+          name: "recent_orders"
+          url: "http://localhost:3001/v1/customers/{customer_id}/orders"
+          method: "GET"
+          timeout: "5s"
+
+    tools:
+      - name: "add_customer_note"
+        description: "Add an internal note to the customer's profile for future reference"
+        type: "http"
+        config:
+          method: "POST"
+          url: "http://localhost:3001/v1/customers/{customer_id}/notes"
+          headers:
+            Content-Type: "application/json"
+          body:
+            note: "{note}"
+        parameters:
+          - name: "customer_id"
+            type: "string"
+            description: "Customer ID from the URL"
+            required: true
+            source: "context"
+            context_path: "customer_id"
+          - name: "note"
+            type: "string"
+            description: "Internal note content about the customer interaction"
+            required: true
+            source: "agent"
+      
+      - name: "apply_loyalty_discount"
+        description: "Apply a loyalty or compensation discount to the customer's next order"
+        type: "http"
+        config:
+          method: "POST"
+          url: "http://localhost:3001/v1/customers/{customer_id}/discounts"
+          headers:
+            Content-Type: "application/json"
+          body:
+            discount_percent: "{discount_percent}"
+            reason: "{reason}"
+        parameters:
+          - name: "customer_id"
+            type: "string"
+            description: "Customer ID from the URL"
+            required: true
+            source: "context"
+            context_path: "customer_id"
+          - name: "discount_percent"
+            type: "number"
+            description: "Discount percentage between 5 and 20"
+            required: true
+            source: "agent"
+          - name: "reason"
+            type: "string"
+            description: "Reason for applying the discount (e.g., compensation, loyalty reward)"
+            required: true
+            source: "agent"
+
+    agent_instructions: |
+      You are a Customer Support Assistant helping support agents manage customer accounts.
+      
+      ⚠️ CRITICAL: YOU ALREADY HAVE ALL CUSTOMER DATA IN YOUR CONTEXT ⚠️
+      
+      === DATA ALREADY AVAILABLE ===
+      You have AUTOMATIC access to:
+      1. 'customer_details' - Complete customer information (name, email, phone, lifetime value, loyalty tier, member since, total orders)
+      2. 'recent_orders' - Recent order history with order IDs, dates, statuses, totals, and return reasons
+      
+      🚨 NEVER ask the agent to "provide data", "paste information", or "extract data"
+      🚨 The data is ALREADY in your context. USE IT IMMEDIATELY.
+      🚨 DO NOT offer options like "extract", "paste data", or "template"
+      
+      === YOUR IMMEDIATE RESPONSE ===
+      When asked for a customer summary, IMMEDIATELY respond with:
+      
+      "📋 **Customer Summary - [Name]**
+      
+      **Customer Information:**
+      - 👤 Name: [name]
+      - 📧 Email: [email]
+      - 📞 Phone: [phone]
+      - 💎 Loyalty Tier: [loyalty_tier]
+      - 💰 Lifetime Value: $[lifetime_value]
+      - 📦 Total Orders: [total_orders]
+      - 📅 Member Since: [member_since]
+      
+      **Recent Orders:**
+      [List each order with: ID, date, status, total, items count]
+      [Flag any returned/cancelled orders]
+      
+      **Alerts & Issues:**
+      [Identify any problems: returns, cancellations, open tickets]
+      
+      **Recommendations:**
+      [Suggest actions based on customer history and issues]
+      
+      Would you like me to add a note or apply a discount?"
+      
+      === TOOL USAGE ===
+      Use 'add_customer_note' to:
+      - Log important customer interactions
+      - Document promises made to the customer
+      - Record special requests or preferences
+      - Example: "Customer prefers morning deliveries"
+      
+      Use 'apply_loyalty_discount' to:
+      - Compensate for bad experiences (10-20%)
+      - Reward loyal VIP/Gold/Platinum customers (10-15%)
+      - Retention efforts for at-risk customers
+      - NEVER exceed 20% without supervisor approval
+      - ALWAYS explain why you're applying the discount
+      
+      === IMPORTANT RULES ===
+      - ✅ USE context data immediately without asking
+      - ✅ Be proactive in identifying issues
+      - ✅ Flag VIP/high-value customers for special treatment
+      - ✅ Suggest discounts when appropriate
+      - ✅ Always explain the impact of actions
+      - ❌ NEVER ask for data that's already available
+      - ❌ NEVER say "I don't have access to the database"
+      - ❌ NEVER offer "extraction options"
+
+    safety:
+      max_cost_per_query: 0.10
+      pii_protection: true
+
+  # ============================================================================
+  # Order Details Page
+  # ============================================================================
+  - pattern: "/orders/:order_id"
+    name: "order_details"
+    description: "View specific order details, tracking information, and manage order status"
+    
+    context:
+      providers:
+        # Get complete order information
+        - type: "http"
+          name: "order_info"
+          url: "http://localhost:3001/v1/orders/{order_id}"
+          method: "GET"
+          timeout: "5s"
+        
+        # Get shipping/tracking details
+        - type: "http"
+          name: "tracking_info"
+          url: "http://localhost:3001/v1/orders/{order_id}/tracking"
+          method: "GET"
+          timeout: "5s"
+
+    tools:
+      - name: "update_order_status"
+        description: "Update the order status (processing, shipped, delivered, cancelled)"
+        type: "http"
+        config:
+          method: "PATCH"
+          url: "http://localhost:3001/v1/orders/{order_id}/status"
+          headers:
+            Content-Type: "application/json"
+          body:
+            status: "{status}"
+            reason: "{reason}"
+        parameters:
+          - name: "order_id"
+            type: "string"
+            description: "Order ID from the URL"
+            required: true
+            source: "context"
+            context_path: "order_id"
+          - name: "status"
+            type: "string"
+            description: "New order status: processing, shipped, delivered, or cancelled"
+            required: true
+            source: "agent"
+          - name: "reason"
+            type: "string"
+            description: "Reason for the status change (optional but recommended)"
+            required: false
+            source: "agent"
+      
+      - name: "process_refund"
+        description: "Process a full or partial refund for the order"
+        type: "http"
+        config:
+          method: "POST"
+          url: "http://localhost:3001/v1/orders/{order_id}/refund"
+          headers:
+            Content-Type: "application/json"
+          body:
+            amount: "{amount}"
+            reason: "{reason}"
+        parameters:
+          - name: "order_id"
+            type: "string"
+            description: "Order ID from the URL"
+            required: true
+            source: "context"
+            context_path: "order_id"
+          - name: "amount"
+            type: "number"
+            description: "Refund amount in dollars (can be partial)"
+            required: true
+            source: "agent"
+          - name: "reason"
+            type: "string"
+            description: "Clear reason for the refund (damaged item, wrong item, etc.)"
+            required: true
+            source: "agent"
+      
+      - name: "resend_tracking_email"
+        description: "Resend the tracking information email to the customer"
+        type: "http"
+        config:
+          method: "POST"
+          url: "http://localhost:3001/v1/orders/{order_id}/resend-tracking"
+          headers:
+            Content-Type: "application/json"
+        parameters:
+          - name: "order_id"
+            type: "string"
+            description: "Order ID from the URL"
+            required: true
+            source: "context"
+            context_path: "order_id"
+
+    agent_instructions: |
+      You are an Order Management Assistant helping support agents resolve order issues.
+      
+      ⚠️ CRITICAL: ORDER DATA IS ALREADY IN YOUR CONTEXT ⚠️
+      
+      === DATA ALREADY AVAILABLE ===
+      You have AUTOMATIC access to:
+      1. 'order_info' - Complete order details (ID, number, date, status, customer info, items, pricing, totals)
+      2. 'tracking_info' - Shipping details (carrier, tracking number, status, estimated delivery, last update)
+      
+      🚨 NEVER ask for order information
+      🚨 USE the data immediately from your context
+      
+      === YOUR IMMEDIATE RESPONSE ===
+      When asked about an order, IMMEDIATELY respond with:
+      
+      "📦 **Order Summary - [Order Number]**
+      
+      **Order Details:**
+      - Order ID: [id]
+      - Date: [date]
+      - Status: [status]
+      - Customer: [customer name] ([customer email])
+      - Total: $[total]
+      
+      **Items:**
+      [List each item with name, quantity, price]
+      
+      **Shipping:**
+      - Carrier: [carrier]
+      - Tracking: [tracking_number]
+      - Status: [tracking status]
+      - Estimated Delivery: [estimated_delivery]
+      - Last Update: [last_update]
+      
+      **Available Actions:**
+      [List appropriate actions based on order status]
+      
+      What would you like to do with this order?"
+      
+      === TOOL USAGE ===
+      Use 'update_order_status' when:
+      - Status needs manual correction
+      - Warehouse confirmed shipment but status not updated
+      - Customer requests cancellation
+      - ALWAYS explain what this means for the customer
+      
+      Use 'process_refund' when:
+      - Item damaged, wrong, or never arrived
+      - Customer not satisfied with product
+      - CONFIRM amount and reason before processing
+      - NEVER exceed $500 without supervisor approval
+      - Consider partial refunds for partial issues
+      - Example: "$50 for damaged packaging, not full $1,299"
+      
+      Use 'resend_tracking_email' when:
+      - Customer didn't receive original email
+      - Customer deleted the email
+      - Low-risk action, do it immediately
+      
+      === IMPORTANT RULES ===
+      - ✅ Check order status before suggesting actions
+      - ✅ Verify tracking before claiming delivery issues
+      - ✅ Explain estimated delivery dates clearly
+      - ✅ For delays, explain next steps proactively
+      - ✅ Confirm large refunds with explicit agent approval
+      - ❌ NEVER process large refunds without confirmation
+      - ❌ NEVER claim data is unavailable
+
+    safety:
+      max_cost_per_query: 0.15
+      pii_protection: true
+
+  # ============================================================================
+  # Inventory Check Page
+  # ============================================================================
+  - pattern: "/inventory/:sku"
+    name: "inventory_check"
+    description: "Check product inventory levels across warehouses and restock information"
+    
+    context:
+      providers:
+        # Get inventory levels
+        - type: "http"
+          name: "inventory_data"
+          url: "http://localhost:3001/v1/inventory/{sku}"
+          method: "GET"
+          timeout: "5s"
+
+    tools:
+      - name: "check_restock_date"
+        description: "Get the estimated restock date for out-of-stock or low-stock items"
+        type: "http"
+        config:
+          method: "GET"
+          url: "http://localhost:3001/v1/inventory/{sku}/restock"
+        parameters:
+          - name: "sku"
+            type: "string"
+            description: "Product SKU from the URL"
+            required: true
+            source: "context"
+            context_path: "sku"
+
+    agent_instructions: |
+      You are an Inventory Assistant helping agents check product availability.
+      
+      ⚠️ INVENTORY DATA IS IN YOUR CONTEXT ⚠️
+      
+      === DATA ALREADY AVAILABLE ===
+      You have access to:
+      - 'inventory_data' - Stock levels across all warehouses (US-WEST, US-EAST, EU), total quantity, product name
+      
+      === YOUR IMMEDIATE RESPONSE ===
+      When asked about inventory, IMMEDIATELY respond with:
+      
+      "📦 **Inventory Status - [Product Name]**
+      
+      **SKU:** [sku]
+      
+      **Total Available:** [quantity] units
+      
+      **Warehouse Breakdown:**
+      - 🏭 US-WEST: [qty] units
+      - 🏭 US-EAST: [qty] units
+      - 🏭 EU: [qty] units
+      
+      **Status:** [High Stock / Low Stock / Out of Stock]
+      
+      [If low/out, suggest checking restock date]"
+      
+      === STOCK LEVEL GUIDANCE ===
+      - **High Stock (>100 units):** "Great news! We have plenty in stock."
+      - **Medium Stock (50-100 units):** "We have good availability."
+      - **Low Stock (10-49 units):** "⚠️ Stock is running low. Consider checking restock date."
+      - **Very Low (<10 units):** "🚨 Critical stock level! Check restock date immediately."
+      - **Out of Stock (0 units):** "❌ Currently out of stock. Let me check restock date."
+      
+      === TOOL USAGE ===
+      Use 'check_restock_date' when:
+      - Stock is below 50 units
+      - Item is out of stock
+      - Customer asking about availability
+      - Planning future orders
+      - Be proactive - suggest checking even if not explicitly asked
+      
+      === EXAMPLES ===
+      High stock: "📦 Excellent news! LAPTOP-001 has 150 units in stock across all warehouses (US-WEST: 75, US-EAST: 50, EU: 25). Ready to ship immediately!"
+      
+      Low stock: "⚠️ HEADPHONES-101 is running low with only 45 units remaining. Would you like me to check when we'll receive more inventory?"
+      
+      Out of stock: "❌ MOUSE-042 is currently out of stock. Let me check the restock date for you..."
+      
+      === IMPORTANT RULES ===
+      - ✅ Always mention total quantity first
+      - ✅ Break down by warehouse
+      - ✅ Be proactive about low stock warnings
+      - ✅ Suggest checking restock for low/out items
+      - ✅ Consider customer location vs warehouse location
+
+    safety:
+      max_cost_per_query: 0.05
+      pii_protection: false
+
+  # ============================================================================
+  # Multi-Customer Search
+  # ============================================================================
+  - pattern: "/search"
+    name: "customer_search"
+    description: "Search and compare multiple customers or orders"
+    
+    context:
+      providers: []
+
+    tools: []
+
+    agent_instructions: |
+      You are a Search Assistant helping agents find customers, orders, or products.
+      
+      === YOUR ROLE ===
+      Guide agents to the correct page based on what they're looking for:
+      
+      **Looking for a customer?**
+      → Navigate to /customers/:customer_id
+      → Example: /customers/cust_892745
+      
+      **Looking for an order?**
+      → Navigate to /orders/:order_id
+      → Example: /orders/ord_78945
+      
+      **Checking inventory?**
+      → Navigate to /inventory/:sku
+      → Example: /inventory/LAPTOP-001
+      
+      === AVAILABLE TEST DATA ===
+      Customers:
+      - cust_892745 (Sarah Johnson)
+      - cust_445566 (Michael Chen)
+      - cust_778899 (Emma Davis)
+      
+      Orders:
+      - ord_78945 (Michael Chen's laptop order)
+      - ord_12345 (Sarah Johnson - delivered)
+      - ord_12344 (Sarah Johnson - returned)
+      
+      Products:
+      - LAPTOP-001 (Premium Laptop 15-inch)
+      - MOUSE-042 (Wireless Mouse)
+      - HEADPHONES-101 (Noise-Cancelling Headphones)
+      
+      === RESPONSE FORMAT ===
+      "To help you with [customer/order/product], please navigate to [route].
+      
+      Once there, I'll be able to:
+      - [Feature 1]
+      - [Feature 2]
+      - [Feature 3]"
+
+    safety:
+      max_cost_per_query: 0.03
+      pii_protection: false
+
+# ==============================================================================
+# FALLBACK ROUTE (Default/Home)
+# ==============================================================================
+fallback:
+  name: "general_support"
+  pattern: "/"
+  description: "General support assistant when no specific route is matched"
+  
+  context:
+    providers: []
+  
+  tools: []
+  
+  agent_instructions: |
+    You are a helpful Support Dashboard Assistant for e-commerce customer service agents.
+    
+    The agent hasn't navigated to a specific page yet, or the current page doesn't have specialized support.
+    
+    === AVAILABLE FEATURES ===
+    
+    🛒 **Customer Management** (/customers/:customer_id)
+    - View complete customer profiles
+    - See order history and lifetime value
+    - Add internal notes
+    - Apply loyalty discounts (5-20%)
+    - Identify VIP customers and issues
+    
+    📦 **Order Management** (/orders/:order_id)
+    - View order details and items
+    - Track shipping status
+    - Update order status
+    - Process refunds (full or partial)
+    - Resend tracking emails
+    
+    📊 **Inventory Management** (/inventory/:sku)
+    - Check stock levels across warehouses
+    - View quantity breakdowns
+    - Get restock dates
+    - Identify low-stock alerts
+    
+    === HOW TO GET STARTED ===
+    
+    Tell me what you need help with:
+    - "I need to help customer [name/ID]"
+    - "What's the status of order [order_id]?"
+    - "Is product [SKU] in stock?"
+    - "Show me customer cust_892745"
+    
+    === TEST DATA AVAILABLE ===
+    
+    **Customers:**
+    - cust_892745 - Sarah Johnson (Gold tier, $1,245 lifetime value)
+    - cust_445566 - Michael Chen (Platinum tier, $2,890 lifetime value)
+    - cust_778899 - Emma Davis (Silver tier, $567 lifetime value)
+    
+    **Orders:**
+    - ord_78945 - $1,468 laptop order (shipped, in transit)
+    - ord_12345 - $189 headphones (delivered)
+    - ord_12344 - $249 returned order (wrong size)
+    
+    **Products:**
+    - LAPTOP-001 - Premium Laptop (150 units in stock)
+    - MOUSE-042 - Wireless Mouse (500 units in stock)
+    - HEADPHONES-101 - Noise-Cancelling Headphones (80 units in stock)
+    
+    === EXAMPLES ===
+    
+    You: "I need to check on Sarah Johnson"
+    Me: "I can help! Sarah Johnson is customer cust_892745. Navigate to /customers/cust_892745 and I'll show you her complete profile, order history, and any issues."
+    
+    You: "Customer asking about order ORD-78945"
+    Me: "Got it! Navigate to /orders/ord_78945 and I'll show you the order details, tracking info, and available actions like processing refunds or updating status."
+    
+    You: "Is the premium laptop in stock?"
+    Me: "Navigate to /inventory/LAPTOP-001 and I'll show you exact stock levels across all warehouses, including US-WEST, US-EAST, and EU locations."
+    
+    What would you like help with today?
+
+  safety:
+    max_cost_per_query: 0.02
+    pii_protection: false
+

@@ -9,6 +9,7 @@ import (
 	"github.com/Abraxas-365/ams/pkg/ai/llm"
 	"github.com/Abraxas-365/ams/pkg/ai/llm/memoryx"
 	"github.com/Abraxas-365/ams/pkg/ai/llm/toolx"
+	"github.com/Abraxas-365/ams/pkg/logx"
 )
 
 // Agent represents an LLM-powered agent with memory and tool capabilities
@@ -65,21 +66,33 @@ func New(client llm.Client, memory memoryx.Memory, opts ...AgentOption) *Agent {
 		opt(agent)
 	}
 
+	logx.WithFields(logx.Fields{
+		"max_auto_iterations":  agent.maxAutoIterations,
+		"max_total_iterations": agent.maxTotalIterations,
+		"has_tools":            agent.tools != nil,
+	}).Debug("Agent initialized")
+
 	return agent
 }
 
 // Run processes a user message and returns the final response
 func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
+	logx.WithField("user_input", userInput).Info("Starting agent run")
+
 	// Add user message to memory
 	if err := a.memory.Add(llm.NewUserMessage(userInput)); err != nil {
+		logx.WithError(err).Error("Failed to add user message to memory")
 		return "", fmt.Errorf("failed to add user message: %w", err)
 	}
+	logx.Debug("User message added to memory")
 
 	// Get messages from memory
 	messages, err := a.memory.Messages()
 	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages from memory")
 		return "", fmt.Errorf("failed to retrieve messages: %w", err)
 	}
+	logx.WithField("message_count", len(messages)).Debug("Retrieved messages from memory")
 
 	// Check if tools are available and add them as options if so
 	options := a.options
@@ -88,39 +101,55 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 		toolList := a.getToolsList()
 		if len(toolList) > 0 {
 			options = append(options, llm.WithTools(toolList))
+			logx.WithField("tool_count", len(toolList)).Debug("Added tools to LLM options")
 		}
 	}
 
 	// Get response from LLM
+	logx.Debug("Calling LLM")
 	response, err := a.client.Chat(ctx, messages, options...)
 	if err != nil {
+		logx.WithError(err).Error("LLM call failed")
 		return "", fmt.Errorf("LLM error: %w", err)
 	}
 
+	logx.WithFields(logx.Fields{
+		"has_content":    response.Message.Content != "",
+		"has_tool_calls": len(response.Message.ToolCalls) > 0,
+		"token_usage":    response.Usage,
+	}).Debug("LLM response received")
+
 	// Add the response to memory
 	if err := a.memory.Add(response.Message); err != nil {
+		logx.WithError(err).Error("Failed to add assistant response to memory")
 		return "", fmt.Errorf("failed to add assistant response: %w", err)
 	}
 
 	// Check if the response contains tool calls
 	if len(response.Message.ToolCalls) > 0 && a.tools != nil {
+		logx.WithField("tool_call_count", len(response.Message.ToolCalls)).Info("Processing tool calls")
 		return a.handleToolCalls(ctx, response.Message.ToolCalls)
 	}
 
+	logx.Info("Agent run completed successfully")
 	return response.Message.Content, nil
 }
 
 // RunStream streams the agent's initial response
 // Note: This doesn't handle tool calls in streaming mode
 func (a *Agent) RunStream(ctx context.Context, userInput string) (llm.Stream, error) {
+	logx.WithField("user_input", userInput).Info("Starting agent stream")
+
 	// Add user message to memory
 	if err := a.memory.Add(llm.NewUserMessage(userInput)); err != nil {
+		logx.WithError(err).Error("Failed to add user message to memory")
 		return nil, fmt.Errorf("failed to add user message: %w", err)
 	}
 
 	// Get messages from memory
 	messages, err := a.memory.Messages()
 	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages from memory")
 		return nil, fmt.Errorf("failed to retrieve messages: %w", err)
 	}
 
@@ -130,10 +159,12 @@ func (a *Agent) RunStream(ctx context.Context, userInput string) (llm.Stream, er
 		toolList := a.getToolsList()
 		if len(toolList) > 0 {
 			options = append(options, llm.WithTools(toolList))
+			logx.WithField("tool_count", len(toolList)).Debug("Added tools to stream options")
 		}
 	}
 
 	// Get streaming response
+	logx.Debug("Initiating stream")
 	return a.client.ChatStream(ctx, messages, options...)
 }
 
@@ -144,21 +175,46 @@ func (a *Agent) handleToolCalls(ctx context.Context, toolCalls []llm.ToolCall) (
 
 // handleToolCallsWithLimit processes tool calls with iteration limit
 func (a *Agent) handleToolCallsWithLimit(ctx context.Context, toolCalls []llm.ToolCall, iteration int) (string, error) {
+	logx.WithFields(logx.Fields{
+		"iteration":       iteration,
+		"tool_call_count": len(toolCalls),
+	}).Debug("Handling tool calls")
+
 	// Hard limit check
 	if iteration >= a.maxTotalIterations {
+		logx.WithFields(logx.Fields{
+			"iteration":            iteration,
+			"max_total_iterations": a.maxTotalIterations,
+		}).Warn("Maximum total iterations exceeded")
 		return "", fmt.Errorf("maximum total iterations (%d) exceeded", a.maxTotalIterations)
 	}
 
 	// Process each tool call
-	for _, tc := range toolCalls {
+	for i, tc := range toolCalls {
+		logx.WithFields(logx.Fields{
+			"tool_index": i,
+			"tool_name":  tc.Function.Name,
+			"tool_id":    tc.ID,
+		}).Debug("Executing tool")
+
 		// Call the tool
 		toolResponse, err := a.tools.Call(ctx, tc)
 		if err != nil {
+			logx.WithFields(logx.Fields{
+				"tool_name": tc.Function.Name,
+				"tool_id":   tc.ID,
+			}).WithError(err).Error("Tool execution failed")
 			return "", fmt.Errorf("tool execution error: %w", err)
 		}
 
+		logx.WithFields(logx.Fields{
+			"tool_name": tc.Function.Name,
+			"tool_id":   tc.ID,
+		}).Debug("Tool executed successfully")
+
 		// Add tool response to memory
 		if err := a.memory.Add(toolResponse); err != nil {
+			logx.WithError(err).Error("Failed to add tool response to memory")
 			return "", fmt.Errorf("failed to add tool response: %w", err)
 		}
 	}
@@ -166,11 +222,13 @@ func (a *Agent) handleToolCallsWithLimit(ctx context.Context, toolCalls []llm.To
 	// Get messages from memory
 	messages, err := a.memory.Messages()
 	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages from memory")
 		return "", fmt.Errorf("failed to retrieve messages: %w", err)
 	}
 
 	// Smart tool choice: "auto" for first maxAutoIterations, then "none"
 	options := a.options
+	toolChoice := "none"
 	if a.tools != nil {
 		toolList := a.getToolsList()
 		if len(toolList) > 0 {
@@ -178,30 +236,48 @@ func (a *Agent) handleToolCallsWithLimit(ctx context.Context, toolCalls []llm.To
 
 			if iteration < a.maxAutoIterations {
 				// First N iterations: allow "auto" tool calling
+				toolChoice = "auto"
 				options = append(options, llm.WithToolChoice("auto"))
 			} else {
 				// After N iterations: force "none" to prevent more tool calls
+				toolChoice = "none"
 				options = append(options, llm.WithToolChoice("none"))
+				logx.WithField("iteration", iteration).Warn("Forcing tool choice to 'none' due to iteration limit")
 			}
 		}
 	}
 
+	logx.WithFields(logx.Fields{
+		"iteration":   iteration,
+		"tool_choice": toolChoice,
+	}).Debug("Calling LLM with tool results")
+
 	// Get next response from LLM with tool results
 	response, err := a.client.Chat(ctx, messages, options...)
 	if err != nil {
+		logx.WithError(err).Error("LLM call failed after tool execution")
 		return "", fmt.Errorf("LLM error: %w", err)
 	}
 
+	logx.WithFields(logx.Fields{
+		"has_content":    response.Message.Content != "",
+		"has_tool_calls": len(response.Message.ToolCalls) > 0,
+		"token_usage":    response.Usage,
+	}).Debug("LLM response received after tool execution")
+
 	// Add the response to memory
 	if err := a.memory.Add(response.Message); err != nil {
+		logx.WithError(err).Error("Failed to add assistant response to memory")
 		return "", fmt.Errorf("failed to add assistant response: %w", err)
 	}
 
 	// Check if we have more tool calls to handle
 	if len(response.Message.ToolCalls) > 0 {
+		logx.WithField("iteration", iteration+1).Debug("More tool calls to process")
 		return a.handleToolCallsWithLimit(ctx, response.Message.ToolCalls, iteration+1)
 	}
 
+	logx.WithField("iteration", iteration).Info("Tool call chain completed")
 	return response.Message.Content, nil
 }
 
@@ -212,28 +288,50 @@ func (a *Agent) getToolsList() []llm.Tool {
 
 // ClearMemory resets the conversation but keeps the system prompt
 func (a *Agent) ClearMemory() error {
-	return a.memory.Clear()
+	logx.Info("Clearing agent memory")
+	err := a.memory.Clear()
+	if err != nil {
+		logx.WithError(err).Error("Failed to clear memory")
+		return err
+	}
+	logx.Debug("Memory cleared successfully")
+	return nil
 }
 
 // AddMessage adds a message to memory
 func (a *Agent) AddMessage(message llm.Message) error {
-	return a.memory.Add(message)
+	logx.WithField("role", message.Role).Debug("Adding message to memory")
+	err := a.memory.Add(message)
+	if err != nil {
+		logx.WithError(err).Error("Failed to add message to memory")
+	}
+	return err
 }
 
 // Messages returns all messages in memory
 func (a *Agent) Messages() ([]llm.Message, error) {
-	return a.memory.Messages()
+	messages, err := a.memory.Messages()
+	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages")
+		return nil, err
+	}
+	logx.WithField("message_count", len(messages)).Debug("Retrieved messages")
+	return messages, nil
 }
 
 // StreamWithTools streams responses while handling tool calls
 // This is a more advanced implementation that processes tool calls in streaming mode
 func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHandler func(chunk string)) error {
+	logx.WithField("user_input", userInput).Info("Starting stream with tools")
+
 	if err := a.memory.Add(llm.NewUserMessage(userInput)); err != nil {
+		logx.WithError(err).Error("Failed to add user message to memory")
 		return fmt.Errorf("failed to add user message: %w", err)
 	}
 
 	messages, err := a.memory.Messages()
 	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages from memory")
 		return fmt.Errorf("failed to retrieve messages: %w", err)
 	}
 
@@ -242,12 +340,15 @@ func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHan
 		toolList := a.getToolsList()
 		if len(toolList) > 0 {
 			options = append(options, llm.WithTools(toolList))
+			logx.WithField("tool_count", len(toolList)).Debug("Added tools to stream")
 		}
 	}
 
 	// Initial streaming response
+	logx.Debug("Starting stream")
 	stream, err := a.client.ChatStream(ctx, messages, options...)
 	if err != nil {
+		logx.WithError(err).Error("Failed to start stream")
 		return err
 	}
 	defer stream.Close()
@@ -256,12 +357,14 @@ func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHan
 	var fullMessage llm.Message
 	var responseContent string
 	var toolCalls []llm.ToolCall
+	chunkCount := 0
 
 	for {
 		chunk, err := stream.Next()
 		if err != nil {
 			// Check if it's the end of the stream
 			if errors.Is(err, io.EOF) {
+				logx.WithField("chunk_count", chunkCount).Debug("Stream ended")
 				// Some implementations might return a final chunk with the error
 				if chunk.Role != "" {
 					fullMessage = chunk
@@ -269,8 +372,11 @@ func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHan
 				break
 			}
 			// Any other error is returned
+			logx.WithError(err).Error("Stream error")
 			return err
 		}
+
+		chunkCount++
 
 		// Accumulate content
 		if chunk.Content != "" {
@@ -281,6 +387,7 @@ func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHan
 		// Collect tool calls if present
 		if len(chunk.ToolCalls) > 0 {
 			toolCalls = chunk.ToolCalls
+			logx.WithField("tool_call_count", len(chunk.ToolCalls)).Debug("Tool calls detected in stream")
 		}
 	}
 
@@ -293,21 +400,30 @@ func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHan
 		}
 	}
 
+	logx.WithFields(logx.Fields{
+		"content_length": len(responseContent),
+		"tool_calls":     len(toolCalls),
+	}).Debug("Stream completed, processing full message")
+
 	// Add the full message to memory
 	if err := a.memory.Add(fullMessage); err != nil {
+		logx.WithError(err).Error("Failed to add assistant response to memory")
 		return fmt.Errorf("failed to add assistant response: %w", err)
 	}
 
 	// Process tool calls if any
 	if len(fullMessage.ToolCalls) > 0 && a.tools != nil {
+		logx.Info("Processing tool calls from stream")
 		streamHandler("\n[Processing tool calls...]\n")
 
 		finalResponse, err := a.handleToolCalls(ctx, fullMessage.ToolCalls)
 		if err != nil {
+			logx.WithError(err).Error("Failed to handle tool calls")
 			return err
 		}
 
 		streamHandler("\n[Final response after tool calls]\n" + finalResponse)
+		logx.Info("Stream with tools completed successfully")
 	}
 
 	return nil
@@ -315,21 +431,34 @@ func (a *Agent) StreamWithTools(ctx context.Context, userInput string, streamHan
 
 // RunConversation runs a complete conversation with multiple turns
 func (a *Agent) RunConversation(ctx context.Context, userInputs []string) ([]string, error) {
+	logx.WithField("turn_count", len(userInputs)).Info("Starting conversation")
 	var responses []string
 
-	for _, input := range userInputs {
+	for i, input := range userInputs {
+		logx.WithFields(logx.Fields{
+			"turn":  i + 1,
+			"total": len(userInputs),
+		}).Debug("Processing conversation turn")
+
 		response, err := a.Run(ctx, input)
 		if err != nil {
+			logx.WithFields(logx.Fields{
+				"turn":  i + 1,
+				"total": len(userInputs),
+			}).WithError(err).Error("Conversation turn failed")
 			return responses, err
 		}
 		responses = append(responses, response)
 	}
 
+	logx.Info("Conversation completed successfully")
 	return responses, nil
 }
 
 // EvaluateWithTools runs the agent with tools and returns detailed execution info
 func (a *Agent) EvaluateWithTools(ctx context.Context, userInput string) (*AgentEvaluation, error) {
+	logx.WithField("user_input", userInput).Info("Starting evaluation with tools")
+
 	eval := &AgentEvaluation{
 		UserInput: userInput,
 		Steps:     []AgentStep{},
@@ -337,6 +466,7 @@ func (a *Agent) EvaluateWithTools(ctx context.Context, userInput string) (*Agent
 
 	// Add user message to memory
 	if err := a.memory.Add(llm.NewUserMessage(userInput)); err != nil {
+		logx.WithError(err).Error("Failed to add user message to memory")
 		return nil, fmt.Errorf("failed to add user message: %w", err)
 	}
 
@@ -348,6 +478,7 @@ func (a *Agent) EvaluateWithTools(ctx context.Context, userInput string) (*Agent
 	// Get messages from memory
 	messages, err := a.memory.Messages()
 	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages from memory")
 		return nil, fmt.Errorf("failed to retrieve messages: %w", err)
 	}
 	evalStep.InputMessages = messages
@@ -358,12 +489,15 @@ func (a *Agent) EvaluateWithTools(ctx context.Context, userInput string) (*Agent
 		toolList := a.getToolsList()
 		if len(toolList) > 0 {
 			options = append(options, llm.WithTools(toolList))
+			logx.WithField("tool_count", len(toolList)).Debug("Added tools for evaluation")
 		}
 	}
 
 	// Get response from LLM
+	logx.Debug("Getting initial LLM response for evaluation")
 	response, err := a.client.Chat(ctx, messages, options...)
 	if err != nil {
+		logx.WithError(err).Error("LLM call failed during evaluation")
 		return nil, fmt.Errorf("LLM error: %w", err)
 	}
 
@@ -371,15 +505,23 @@ func (a *Agent) EvaluateWithTools(ctx context.Context, userInput string) (*Agent
 	evalStep.TokenUsage = response.Usage
 	eval.Steps = append(eval.Steps, evalStep)
 
+	logx.WithFields(logx.Fields{
+		"has_tool_calls": len(response.Message.ToolCalls) > 0,
+		"token_usage":    response.Usage,
+	}).Debug("Initial evaluation step completed")
+
 	// Add the response to memory
 	if err := a.memory.Add(response.Message); err != nil {
+		logx.WithError(err).Error("Failed to add assistant response to memory")
 		return nil, fmt.Errorf("failed to add assistant response: %w", err)
 	}
 
 	// Check if the response contains tool calls
 	if len(response.Message.ToolCalls) > 0 && a.tools != nil {
+		logx.WithField("tool_call_count", len(response.Message.ToolCalls)).Info("Evaluating tool calls")
 		result, steps, err := a.evaluateToolCalls(ctx, response.Message.ToolCalls)
 		if err != nil {
+			logx.WithError(err).Error("Tool call evaluation failed")
 			return nil, err
 		}
 
@@ -389,6 +531,7 @@ func (a *Agent) EvaluateWithTools(ctx context.Context, userInput string) (*Agent
 		eval.FinalResponse = response.Message.Content
 	}
 
+	logx.WithField("total_steps", len(eval.Steps)).Info("Evaluation completed successfully")
 	return eval, nil
 }
 
@@ -401,8 +544,17 @@ func (a *Agent) evaluateToolCalls(ctx context.Context, toolCalls []llm.ToolCall)
 func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.ToolCall, iteration int) (string, []AgentStep, error) {
 	var steps []AgentStep
 
+	logx.WithFields(logx.Fields{
+		"iteration":       iteration,
+		"tool_call_count": len(toolCalls),
+	}).Debug("Evaluating tool calls with limit")
+
 	// Hard limit check
 	if iteration >= a.maxTotalIterations {
+		logx.WithFields(logx.Fields{
+			"iteration":            iteration,
+			"max_total_iterations": a.maxTotalIterations,
+		}).Warn("Maximum total iterations exceeded during evaluation")
 		return "", steps, fmt.Errorf("maximum total iterations (%d) exceeded", a.maxTotalIterations)
 	}
 
@@ -413,10 +565,20 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 	}
 
 	var toolResponses []llm.Message
-	for _, tc := range toolCalls {
+	for i, tc := range toolCalls {
+		logx.WithFields(logx.Fields{
+			"tool_index": i,
+			"tool_name":  tc.Function.Name,
+			"tool_id":    tc.ID,
+		}).Debug("Evaluating tool execution")
+
 		// Call the tool
 		toolResponse, err := a.tools.Call(ctx, tc)
 		if err != nil {
+			logx.WithFields(logx.Fields{
+				"tool_name": tc.Function.Name,
+				"tool_id":   tc.ID,
+			}).WithError(err).Error("Tool execution failed during evaluation")
 			return "", steps, fmt.Errorf("tool execution error: %w", err)
 		}
 
@@ -424,6 +586,7 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 
 		// Add tool response to memory
 		if err := a.memory.Add(toolResponse); err != nil {
+			logx.WithError(err).Error("Failed to add tool response to memory")
 			return "", steps, fmt.Errorf("failed to add tool response: %w", err)
 		}
 	}
@@ -434,6 +597,7 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 	// Get messages from memory
 	messages, err := a.memory.Messages()
 	if err != nil {
+		logx.WithError(err).Error("Failed to retrieve messages from memory")
 		return "", steps, fmt.Errorf("failed to retrieve messages: %w", err)
 	}
 
@@ -444,6 +608,7 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 	}
 
 	options := a.options
+	toolChoice := "none"
 	if a.tools != nil {
 		toolList := a.getToolsList()
 		if len(toolList) > 0 {
@@ -451,16 +616,25 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 
 			if iteration < a.maxAutoIterations {
 				// First N iterations: allow "auto" tool calling
+				toolChoice = "auto"
 				options = append(options, llm.WithToolChoice("auto"))
 			} else {
 				// After N iterations: force "none" to prevent more tool calls
+				toolChoice = "none"
 				options = append(options, llm.WithToolChoice("none"))
+				logx.WithField("iteration", iteration).Warn("Forcing tool choice to 'none' during evaluation")
 			}
 		}
 	}
 
+	logx.WithFields(logx.Fields{
+		"iteration":   iteration,
+		"tool_choice": toolChoice,
+	}).Debug("Getting LLM response with tool results")
+
 	response, err := a.client.Chat(ctx, messages, options...)
 	if err != nil {
+		logx.WithError(err).Error("LLM call failed during evaluation")
 		return "", steps, fmt.Errorf("LLM error: %w", err)
 	}
 
@@ -470,11 +644,13 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 
 	// Add the response to memory
 	if err := a.memory.Add(response.Message); err != nil {
+		logx.WithError(err).Error("Failed to add assistant response to memory")
 		return "", steps, fmt.Errorf("failed to add assistant response: %w", err)
 	}
 
 	// Check if we have more tool calls to handle
 	if len(response.Message.ToolCalls) > 0 {
+		logx.WithField("iteration", iteration+1).Debug("More tool calls to evaluate")
 		result, moreSteps, err := a.evaluateToolCallsWithLimit(ctx, response.Message.ToolCalls, iteration+1)
 		if err != nil {
 			return "", steps, err
@@ -484,6 +660,7 @@ func (a *Agent) evaluateToolCallsWithLimit(ctx context.Context, toolCalls []llm.
 		return result, steps, nil
 	}
 
+	logx.WithField("iteration", iteration).Info("Tool call evaluation chain completed")
 	return response.Message.Content, steps, nil
 }
 

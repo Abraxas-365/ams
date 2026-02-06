@@ -3,28 +3,28 @@ version: '3.8'
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: manifesto-postgres
+    container_name: delfosti-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-manifestodb}
-      POSTGRES_USER: ${POSTGRES_USER:-manifesto}
+      POSTGRES_DB: ${POSTGRES_DB:-delfostidb}
+      POSTGRES_USER: ${POSTGRES_USER:-delfosti}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supersecret}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5436}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/migrations:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-manifesto}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-delfosti}"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - manifesto-network
+      - delfosti-network
 
   redis:
     image: redis:7-alpine
-    container_name: manifesto-redis
+    container_name: delfosti-redis
     restart: unless-stopped
     command: >
       redis-server
@@ -42,7 +42,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - manifesto-network
+      - delfosti-network
 
 volumes:
   postgres_data:
@@ -51,5 +51,5 @@ volumes:
     driver: local
 
 networks:
-  manifesto-network:
+  delfosti-network:
     driver: bridge

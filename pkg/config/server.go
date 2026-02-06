@@ -10,7 +10,7 @@ type ServerConfig struct {
 
 func loadServerConfig() ServerConfig {
 	return ServerConfig{
-		Port:        getEnvInt("SERVER_PORT", 8080),
+		Port:        getEnvInt("SERVER_PORT", 8081),
 		Environment: getEnv("ENVIRONMENT", "development"),
 		LogLevel:    getEnv("LOG_LEVEL", "info"),
 		BaseURL:     getEnv("BASE_URL", "http://localhost:8080"),

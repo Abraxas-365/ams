@@ -40,7 +40,7 @@ func NewOpenAIProvider(apiKey string, opts ...option.RequestOption) *OpenAIProvi
 
 func defaultChatOptions() *llm.ChatOptions {
 	options := llm.DefaultOptions()
-	options.Model = "gpt-4o"
+	options.Model = "gpt-5-mini-2025-08-07"
 	return options
 }
 
